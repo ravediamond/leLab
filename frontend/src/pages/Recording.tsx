@@ -56,6 +56,7 @@ interface RecordingConfig {
   push_to_hub: boolean;
   resume: boolean;
   streaming_encoding: boolean;
+  start_on_motion?: boolean;
 }
 
 type Phase = "preparing" | "recording" | "resetting" | "completed";
@@ -73,6 +74,8 @@ interface BackendStatus {
   dataset_repo_id?: string;
   error?: string;
   cameras?: string[]; // Names of the cameras configured for this session
+  // The episode is recording but holds its frames until the leader moves.
+  waiting_for_motion?: boolean;
   available_controls: {
     stop_recording: boolean;
     exit_early: boolean;
@@ -673,6 +676,8 @@ const Recording = () => {
   const sessionElapsedTime = backendStatus.session_elapsed_seconds || 0;
 
   const getStatusText = () => {
+    if (currentPhase === "recording" && !optimisticPhase && backendStatus.waiting_for_motion)
+      return `MOVE THE LEADER TO START EPISODE ${currentEpisode}`;
     if (currentPhase === "recording") return `RECORDING EPISODE ${currentEpisode}`;
     if (currentPhase === "resetting") return "RESET — GET READY";
     if (currentPhase === "preparing") return "PREPARING SESSION";

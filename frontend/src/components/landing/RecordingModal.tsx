@@ -46,6 +46,8 @@ interface RecordingModalProps {
   setResetTimeS: (value: number) => void;
   streamingEncoding: boolean;
   setStreamingEncoding: (value: boolean) => void;
+  startOnMotion: boolean;
+  setStartOnMotion: (value: boolean) => void;
   cameras: CameraConfig[];
   setCameras: (cameras: CameraConfig[]) => void;
   onStart: () => void;
@@ -70,6 +72,8 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
   setResetTimeS,
   streamingEncoding,
   setStreamingEncoding,
+  startOnMotion,
+  setStartOnMotion,
   cameras,
   setCameras,
   onStart,
@@ -316,6 +320,28 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                       Encodes frames in real time during capture so each
                       episode saves almost instantly. Uncheck to fall back to
                       the slower PNG-then-encode flow.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <Checkbox
+                    id="startOnMotion"
+                    checked={startOnMotion}
+                    onCheckedChange={(value) => setStartOnMotion(value === true)}
+                    className="mt-0.5 border-gray-500 data-[state=checked]:bg-red-500 data-[state=checked]:border-red-500"
+                  />
+                  <div className="space-y-1">
+                    <Label
+                      htmlFor="startOnMotion"
+                      className="text-sm font-medium text-gray-200 cursor-pointer"
+                    >
+                      Start each episode when the leader arm moves
+                    </Label>
+                    <p className="text-xs text-gray-500">
+                      Drops the stillness at the start of each episode and
+                      keeps half a second before the first movement, so the
+                      policy doesn't learn to wait. The episode timer still
+                      runs while you hold still.
                     </p>
                   </div>
                 </div>

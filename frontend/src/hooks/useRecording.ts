@@ -33,6 +33,7 @@ export const useRecording = (robot: RobotRecord | null) => {
   const [episodeTimeS, setEpisodeTimeS] = useState(60);
   const [resetTimeS, setResetTimeS] = useState(15);
   const [streamingEncoding, setStreamingEncoding] = useState(true);
+  const [startOnMotion, setStartOnMotion] = useState(false);
   const [cameras, setCameras] = useState<CameraConfig[]>([]);
 
   const releaseStreamsRef = useRef<(() => void) | null>(null);
@@ -144,6 +145,7 @@ export const useRecording = (robot: RobotRecord | null) => {
       push_to_hub: false,
       resume: appendTo !== null,
       streaming_encoding: streamingEncoding,
+      start_on_motion: startOnMotion,
       cameras: cameraDict,
     };
 
@@ -172,6 +174,8 @@ export const useRecording = (robot: RobotRecord | null) => {
       setResetTimeS,
       streamingEncoding,
       setStreamingEncoding,
+      startOnMotion,
+      setStartOnMotion,
       cameras,
       setCameras,
       onStart,

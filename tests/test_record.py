@@ -228,7 +228,7 @@ def test_worker_releases_active_state_when_path_probe_fails(
     def boom(repo_id):
         raise OSError("Too many levels of symbolic links")
 
-    def fail_recording(cfg, events):
+    def fail_recording(cfg, events, start_on_motion):
         raise RuntimeError("recording failed")
 
     monkeypatch.setattr(record, "_resolve_dataset_dir", boom)
@@ -463,3 +463,88 @@ def test_handle_delete_dataset_hub_failure_keeps_local_copy(
 
     assert result["success"] is False
     assert dataset_dir.exists()
+
+
+# ── start on motion ─────────────────────────────────────────────────────────
+
+
+class _FrameSink:
+    fps = 30
+    features = {"action": {"dtype": "float32", "shape": (2,)}}
+
+    def __init__(self) -> None:
+        self.frames: list[int] = []
+
+    def add_frame(self, frame: dict) -> None:
+        self.frames.append(frame["n"])
+
+
+def _gate_frames(gate, positions: list[tuple[float, float]]) -> None:
+    import numpy as np
+
+    for n, position in enumerate(positions):
+        gate.add_frame({"n": n, "action": np.array(position, dtype=np.float32)})
+
+
+def test_motion_gate_drops_stillness_and_keeps_a_lead_in() -> None:
+    from lelab.record import MotionGatedDataset
+
+    sink = _FrameSink()
+    gate = MotionGatedDataset(sink, threshold=3.0, lead_in_frames=2)
+    # Still within encoder-tick noise for frames 0-5, past 3 deg at frame 6.
+    _gate_frames(gate, [(0, 0), (0.09, 0), (0, 0.09), (0, 0), (0.5, 0), (1.5, 0), (3.5, 0), (8, 0), (9, 0)])
+
+    assert gate.moved
+    assert gate.dropped_frames == 4
+    assert sink.frames == [4, 5, 6, 7, 8]
+    assert gate.fps == 30 and gate.features is sink.features
+
+
+def test_motion_gate_keeps_the_lead_in_when_the_leader_never_moves() -> None:
+    from lelab.record import MotionGatedDataset
+
+    sink = _FrameSink()
+    gate = MotionGatedDataset(sink, threshold=3.0, lead_in_frames=2)
+    _gate_frames(gate, [(0, 0)] * 6)
+    assert sink.frames == []
+
+    gate.flush()
+
+    assert not gate.moved
+    assert sink.frames == [3, 4, 5]
+
+
+def test_motion_gate_saves_a_trimmed_lerobot_episode(tmp_lerobot_home) -> None:
+    import numpy as np
+
+    from lelab.record import MotionGatedDataset
+    from lerobot.datasets import LeRobotDataset
+
+    features = {"action": {"dtype": "float32", "shape": (1,), "names": ["a"]}}
+    dataset = LeRobotDataset.create("alice/demo", fps=10, features=features, use_videos=False)
+    gate = MotionGatedDataset(dataset, threshold=3.0, lead_in_frames=2)
+    for position in [0, 0, 0, 0, 0, 5, 10, 15]:
+        gate.add_frame({"action": np.full(1, position, dtype=np.float32), "task": "pick"})
+    gate.flush()
+    dataset.save_episode()
+    dataset.finalize()
+
+    episode = LeRobotDataset("alice/demo", root=dataset.root)
+    assert [float(episode[i]["action"]) for i in range(len(episode))] == [0, 0, 5, 10, 15]
+    assert [round(float(episode[i]["timestamp"]), 1) for i in range(len(episode))] == [0, 0.1, 0.2, 0.3, 0.4]
+
+
+def test_recording_status_reports_waiting_for_motion(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lelab import record
+
+    gate = record.MotionGatedDataset(_FrameSink(), threshold=3.0, lead_in_frames=2)
+    monkeypatch.setattr(record, "recording_active", True)
+    monkeypatch.setattr(record, "recording_config", MagicMock(cameras={}, num_episodes=1))
+    monkeypatch.setattr(record, "motion_gate", gate)
+    assert record.handle_recording_status()["waiting_for_motion"] is True
+
+    _gate_frames(gate, [(0, 0), (5, 0)])
+    assert record.handle_recording_status()["waiting_for_motion"] is False
+
+    monkeypatch.setattr(record, "motion_gate", None)
+    assert record.handle_recording_status()["waiting_for_motion"] is False

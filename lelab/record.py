@@ -18,9 +18,11 @@ import shutil
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, field_validator
 
 from lerobot.configs.dataset import DatasetRecordConfig
@@ -55,6 +57,9 @@ current_episode = 1  # Track current episode number
 saved_episodes = 0  # Track how many episodes have been saved
 current_phase = "preparing"  # Track current phase: "preparing", "recording", "resetting", "completed"
 phase_start_time = None  # Track when current phase started
+# Holds back the current episode's frames until the leader moves, when the
+# session records with `start_on_motion`. None outside the recording phase.
+motion_gate: "MotionGatedDataset | None" = None
 last_recording_info: dict[str, Any] | None = (
     None  # Snapshot of the most recently completed dataset (for /dataset-info)
 )
@@ -80,6 +85,8 @@ class RecordingRequest(BaseModel):
     private: bool = False
     resume: bool = False
     streaming_encoding: bool = True
+    # Drop the stillness before the leader first moves in each episode.
+    start_on_motion: bool = False
     cameras: dict[str, dict[str, Any]] = {}
     test_mode: bool = False  # Skip robot connection for testing
 
@@ -98,6 +105,56 @@ class UploadRequest(BaseModel):
 class DatasetInfoRequest(BaseModel):
     dataset_repo_id: str
     delete_from_hub: bool = False
+
+
+# Leader positions are in degrees (the gripper in 0-100). Held still, an SO-101
+# leader reads within a few encoder ticks (0.088 deg each) of where it started;
+# a deliberate start takes a joint past 3 deg within a few frames.
+MOTION_START_THRESHOLD = 3.0
+# Stillness kept before the first motion, so the episode opens on the start of
+# the movement rather than on its first 3 deg.
+MOTION_LEAD_IN_S = 0.5
+
+
+class MotionGatedDataset:
+    """Stands in for the dataset during an episode and drops the stillness before the leader moves.
+
+    `record_loop` only reads `fps` and `features` from the dataset and calls
+    `add_frame`, so the rest is delegated. Each frame's action (the leader
+    position) is compared with the episode's first one: until a joint has moved
+    more than `threshold`, only the last `lead_in_frames` frames are kept.
+    """
+
+    def __init__(self, dataset: LeRobotDataset, threshold: float, lead_in_frames: int):
+        self._dataset = dataset
+        self._threshold = threshold
+        # +1: the frame that crosses the threshold is kept on top of the lead-in.
+        self._held: deque[dict] = deque(maxlen=lead_in_frames + 1)
+        self._rest: np.ndarray | None = None
+        self.moved = False
+        self.dropped_frames = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._dataset, name)
+
+    def add_frame(self, frame: dict) -> None:
+        if self.moved:
+            self._dataset.add_frame(frame)
+            return
+        action = np.asarray(frame["action"], dtype=np.float64)
+        if self._rest is None:
+            self._rest = action
+        if len(self._held) == self._held.maxlen:
+            self.dropped_frames += 1
+        self._held.append(frame)
+        if np.abs(action - self._rest).max() > self._threshold:
+            self.moved = True
+            self.flush()
+
+    def flush(self) -> None:
+        """Write the held frames. An episode where the leader never moved keeps its lead-in."""
+        while self._held:
+            self._dataset.add_frame(self._held.popleft())
 
 
 def _normalize_dataset_repo_id(repo_id: str) -> str:
@@ -335,7 +392,9 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                     )
                     time.sleep(2.0)
 
-                dataset = record_with_web_events(record_config, recording_events)
+                dataset = record_with_web_events(
+                    record_config, recording_events, start_on_motion=request.start_on_motion
+                )
                 logger.info(f"Recording completed successfully. Dataset has {dataset.num_episodes} episodes")
                 last_recording_info = {
                     "success": True,
@@ -516,6 +575,9 @@ def handle_recording_status() -> dict[str, Any]:
 
     # Add episode information if recording is active
     if recording_active and recording_config:
+        # Bound once: the worker clears it when the recording phase ends.
+        gate = motion_gate
+        status["waiting_for_motion"] = gate is not None and not gate.moved
         status["current_episode"] = current_episode
         status["total_episodes"] = recording_config.num_episodes
         status["saved_episodes"] = saved_episodes  # Track completed episodes
@@ -778,7 +840,9 @@ def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
         return {"success": False, "message": f"Failed to upload dataset: {str(e)}"}
 
 
-def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDataset:
+def record_with_web_events(
+    cfg: RecordConfig, web_events: dict, start_on_motion: bool = False
+) -> LeRobotDataset:
     """
     Implement recording with phase tracking - exactly mirrors original record() function behavior
     """
@@ -796,7 +860,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     from lerobot.utils.feature_utils import hw_to_dataset_features
     from lerobot.utils.utils import log_say
 
-    global current_phase, phase_start_time, current_episode, saved_episodes, current_robot
+    global current_phase, phase_start_time, current_episode, saved_episodes, current_robot, motion_gate
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
@@ -966,7 +1030,28 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             web_events["_exit_early_triggered"] = False
             logger.info(f"Recording phase - calling record_loop with events: {web_events}")
 
-            record_loop(**loop_kwargs, dataset=dataset, control_time_s=cfg.dataset.episode_time_s)
+            gate = None
+            if start_on_motion:
+                gate = MotionGatedDataset(
+                    dataset, MOTION_START_THRESHOLD, round(MOTION_LEAD_IN_S * cfg.dataset.fps)
+                )
+                motion_gate = gate
+            try:
+                record_loop(
+                    **loop_kwargs,
+                    dataset=gate if gate is not None else dataset,
+                    control_time_s=cfg.dataset.episode_time_s,
+                )
+            finally:
+                motion_gate = None
+            if gate is not None:
+                gate.flush()
+                if gate.dropped_frames:
+                    logger.info(
+                        "Dropped %.1f s of stillness before the leader moved in episode %d",
+                        gate.dropped_frames / cfg.dataset.fps,
+                        current_episode,
+                    )
 
             logger.info(f"Recording phase completed - events state: {web_events}")
 
